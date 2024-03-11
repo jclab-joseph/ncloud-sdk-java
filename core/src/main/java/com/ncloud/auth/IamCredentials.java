@@ -16,7 +16,7 @@ import javax.crypto.spec.SecretKeySpec;
 import org.apache.commons.codec.binary.Base64;
 
 import com.ncloud.exception.SdkException;
-import okhttp3.Request;
+import org.apache.hc.client5.http.async.methods.SimpleHttpRequest;
 
 /**
  * The type Iam credentials.
@@ -49,7 +49,7 @@ public class IamCredentials implements Credentials {
 		this.provider = provider;
 	}
 
-    public void applyCredentials(Request.Builder requestBuilder, boolean isRequiredApiKey) {
+    public void applyCredentials(SimpleHttpRequest request, boolean isRequiredApiKey) {
 		if (provider != null) {
 			Credentials credentials = provider.getCredentials();
 			copyCredentials(credentials);
@@ -57,11 +57,11 @@ public class IamCredentials implements Credentials {
 
         long timestamp = new Date().getTime();
 		if (isRequiredApiKey == true) {
-        	requestBuilder.addHeader("x-ncp-apigw-api-key", apiKey);
+			request.addHeader("x-ncp-apigw-api-key", apiKey);
 		}
-        requestBuilder.addHeader("x-ncp-apigw-timestamp", String.valueOf(timestamp));
-        requestBuilder.addHeader("x-ncp-iam-access-key", accessKey);
-        requestBuilder.addHeader("x-ncp-apigw-signature-v2", makeSignature(timestamp, requestBuilder.build()));
+		request.addHeader("x-ncp-apigw-timestamp", String.valueOf(timestamp));
+		request.addHeader("x-ncp-iam-access-key", accessKey);
+		request.addHeader("x-ncp-apigw-signature-v2", makeSignature(timestamp, request));
     }
 
 	private void copyCredentials(Credentials newCred) {
@@ -72,14 +72,14 @@ public class IamCredentials implements Credentials {
 		}
 	}
 
-	private String makeSignature(long timestamp, Request request) {
-        URI uri = request.url().uri();
+	private String makeSignature(long timestamp, SimpleHttpRequest request) {
+        URI uri = URI.create(request.getRequestUri());
         String pathWithQuery = uri.getRawPath();
         if (uri.getRawQuery() != null) {
             pathWithQuery = pathWithQuery + "?"+ uri.getRawQuery();
         }
         StringBuilder message = new StringBuilder()
-            .append(request.method()).append(" ").append(pathWithQuery).append("\n")
+            .append(request.getMethod()).append(" ").append(pathWithQuery).append("\n")
             .append(timestamp).append("\n")
 		    .append(accessKey);
 

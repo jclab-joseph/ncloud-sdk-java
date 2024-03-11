@@ -5,16 +5,14 @@
  */
 package com.ncloud;
 
-import java.io.File;
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.UnsupportedEncodingException;
+import java.net.URISyntaxException;
 import java.net.URLEncoder;
-import java.util.Collection;
-import java.util.LinkedHashSet;
-import java.util.Map;
-import java.util.Set;
-
-import jakarta.activation.MimetypesFileTypeMap;
+import java.nio.charset.StandardCharsets;
+import java.util.*;
+import java.util.concurrent.CompletableFuture;
 
 import org.apache.commons.lang3.StringUtils;
 
@@ -23,22 +21,18 @@ import com.ncloud.auth.CredentialsProvider;
 import com.ncloud.auth.CredentialsProviderChain;
 import com.ncloud.auth.EnvironmentVariableCredentialsProvider;
 import com.ncloud.auth.NcloudCredentialsProvider;
-import com.ncloud.auth.PropertiesFileCredentialsProvider;
 import com.ncloud.auth.ServerRoleCredentialsProvider;
 import com.ncloud.exception.ApiException;
 import com.ncloud.exception.SdkException;
 import com.ncloud.marshaller.FormMarshaller;
 import com.ncloud.marshaller.Marshaller;
-import okhttp3.Headers;
-import okhttp3.HttpUrl;
-import okhttp3.MediaType;
-import okhttp3.MultipartBody;
-import okhttp3.OkHttpClient;
-import okhttp3.Request;
-import okhttp3.RequestBody;
-import okhttp3.Response;
-import okhttp3.internal.http.HttpMethod;
-import okhttp3.logging.HttpLoggingInterceptor;
+import org.apache.hc.client5.http.async.methods.SimpleHttpRequest;
+import org.apache.hc.client5.http.async.methods.SimpleHttpResponse;
+import org.apache.hc.client5.http.impl.async.CloseableHttpAsyncClient;
+import org.apache.hc.core5.concurrent.FutureCallback;
+import org.apache.hc.core5.http.ContentType;
+import org.apache.hc.core5.http.Header;
+import org.apache.hc.core5.net.URIBuilder;
 
 /**
  * The type Api client.
@@ -46,17 +40,17 @@ import okhttp3.logging.HttpLoggingInterceptor;
 public class ApiClient {
 	private String apigatewayEndpoint = "https://ncloud.apigw.ntruss.com";
 	private final String SDK_VERSION = "1.1";
-	private final OkHttpClient httpClient;
+	private final CloseableHttpAsyncClient httpClient;
 	private final Set<Marshaller> marshallerSet;
 	private CredentialsProvider credentialsProvider;
 	private Credentials credentials;
 
-	private ApiClient(OkHttpClient httpClient, Set<Marshaller> marshallerSet) {
+	public ApiClient(CloseableHttpAsyncClient httpClient, Set<Marshaller> marshallerSet) {
 		this(httpClient, marshallerSet, null);
 	}
 
-	private ApiClient(OkHttpClient httpClient, Set<Marshaller> marshallerSet, CredentialsProvider credentialsProvider) {
-		if (marshallerSet.isEmpty() == true) {
+	public ApiClient(CloseableHttpAsyncClient httpClient, Set<Marshaller> marshallerSet, CredentialsProvider credentialsProvider) {
+		if (marshallerSet.isEmpty()) {
 			throw new SdkException("Marshaller is needed at least one.");
 		}
 		this.httpClient = httpClient;
@@ -87,7 +81,7 @@ public class ApiClient {
 	 * @param apiRequest the api request
 	 * @return the api response
 	 */
-	public <T> ApiResponse<T> call(ApiRequest apiRequest) {
+	public <T> CompletableFuture<ApiResponse<T>> call(ApiRequest apiRequest) {
 		return call(apiRequest, null);
 	}
 
@@ -99,32 +93,40 @@ public class ApiClient {
 	 * @param returnType the return type
 	 * @return the api response
 	 */
-	public <T> ApiResponse<T> call(ApiRequest apiRequest, Class returnType) {
-		Request request = makeRequest(apiRequest);
-		Response response = getResponse(request);
-
-		if (response.isSuccessful() == false) {
-			throw new ApiException("The response failed", response.code(), response.headers().toMultimap(),
-				response.body().byteStream());
-		}
-
-		try {
-			if (returnType == null) {
-				return new ApiResponse(response.code(), response.headers().toMultimap(), null);
+	public <T> CompletableFuture<ApiResponse<T>> call(ApiRequest apiRequest, Class returnType) {
+		SimpleHttpRequest request = makeRequest(apiRequest);
+		return getResponse(request).thenApply((response) -> {
+			Map<String, List<String>> headers = new HashMap<>();
+			for (Header item : response.getHeaders()) {
+				headers.compute(item.getName(), (k, v) -> {
+					if (v == null) {
+						v = new ArrayList<>();
+					}
+					v.add(item.getValue());
+					return v;
+				});
 			}
-			if (returnType == byte[].class) {
-				byte[] responseBody = (response.body() == null) ? null : response.body().bytes();
-				return new ApiResponse(response.code(), response.headers().toMultimap(), responseBody);
+			if (response.getCode() < 200 || response.getCode() >= 300) {
+				throw new ApiException("The response failed", response.getCode(), headers, new ByteArrayInputStream(response.getBodyBytes()));
 			}
+			try {
+				if (returnType == null) {
+					return new ApiResponse(response.getCode(), headers, null);
+				}
+				if (returnType == byte[].class) {
+					return new ApiResponse(response.getCode(), headers, new ByteArrayInputStream(response.getBodyBytes()));
+				}
 
-			String contentType = response.header("content-type");
-			Marshaller marshaller = getMarshaller(contentType);
-			T responseBody = marshaller.readValue(response.body().byteStream(), returnType);
-			return new ApiResponse(response.code(), response.headers().toMultimap(), responseBody);
-		} catch (IOException e) {
-			throw new ApiException("Failed to deserialize response: " + e.getMessage(), e, response.code(),
-				response.headers().toMultimap(), response.body().byteStream());
-		}
+				String contentType = Optional.ofNullable(response.getContentType()).map(ContentType::toString).orElse(null);
+				Marshaller marshaller = getMarshaller(contentType);
+				T responseBody = marshaller.readValue(new ByteArrayInputStream(response.getBodyBytes()), returnType);
+				return new ApiResponse(response.getCode(), headers, responseBody);
+			} catch (Exception e) {
+				throw new ApiException(
+						"Failed to deserialize response: " + e.getMessage(),
+						response.getCode(), headers, new ByteArrayInputStream(response.getBodyBytes()));
+			}
+		});
 	}
 
 	/**
@@ -156,16 +158,20 @@ public class ApiClient {
 		return marshallerSet.iterator().next().getContentType();
 	}
 
-	private Request makeRequest(ApiRequest apiRequest) {
+	private SimpleHttpRequest makeRequest(ApiRequest apiRequest) {
 		try {
-			Headers headers = getHeaders(apiRequest.getHttpHeaders());
-			Request.Builder requestBuilder = new Request.Builder()
-				.url(getUrl(apiRequest))
-				.headers(headers)
-				.method(apiRequest.getMethod(), getRequestBody(apiRequest));
+			SimpleHttpRequest request = SimpleHttpRequest.create(
+					apiRequest.getMethod(),
+					getUrl(apiRequest)
+			);
+			applyHeaders(request, apiRequest.getHttpHeaders());
+			RequestBody body = getRequestBody(apiRequest);
+			if (body != null) {
+				request.setBody(body.body, body.contentType);
+			}
 			Credentials credentials = loadCredentials();
-			credentials.applyCredentials(requestBuilder, apiRequest.isRequiredApiKey());
-			return requestBuilder.build();
+			credentials.applyCredentials(request, apiRequest.isRequiredApiKey());
+			return request;
 		} catch (Exception e) {
 			throw new SdkException("Failed to create request: " + e.getMessage(), e);
 		}
@@ -183,32 +189,34 @@ public class ApiClient {
 	}
 
 	private String getUrl(ApiRequest apiRequest) throws IOException {
-		HttpUrl.Builder httpUrlBuilder = HttpUrl.parse(
-			this.apigatewayEndpoint + apiRequest.getBasePath() + apiRequest.getPath()).newBuilder();
-		Map<String, Object> queryParams = apiRequest.getQueryParams();
-		if (apiRequest.isCustomFormParams() == true && apiRequest.getMethod().equalsIgnoreCase("GET") == true) {
-			Marshaller marshaller = FormMarshaller.getInstance();
-			return httpUrlBuilder.toString() + "?" + marshaller.writeValueAsString(apiRequest.getBody());
-		}
-		for (Map.Entry<String, Object> entry : queryParams.entrySet()) {
-			if (entry.getValue() instanceof Collection) {
-				for (Object value : (Collection)entry.getValue()) {
-					httpUrlBuilder.addQueryParameter(entry.getKey(), String.valueOf(value));
-				}
-			} else {
-				httpUrlBuilder.addQueryParameter(entry.getKey(), String.valueOf(entry.getValue()));
+		try {
+			URIBuilder httpUrlBuilder = new URIBuilder(this.apigatewayEndpoint + apiRequest.getBasePath() + apiRequest.getPath());
+
+			Map<String, Object> queryParams = apiRequest.getQueryParams();
+			if (apiRequest.isCustomFormParams() && apiRequest.getMethod().equalsIgnoreCase("GET")) {
+				Marshaller marshaller = FormMarshaller.getInstance();
+				return httpUrlBuilder.build().toString() + "?" + marshaller.writeValueAsString(apiRequest.getBody());
 			}
+			for (Map.Entry<String, Object> entry : queryParams.entrySet()) {
+				if (entry.getValue() instanceof Collection) {
+					for (Object value : (Collection)entry.getValue()) {
+						httpUrlBuilder.addParameter(entry.getKey(), String.valueOf(value));
+					}
+				} else {
+					httpUrlBuilder.addParameter(entry.getKey(), String.valueOf(entry.getValue()));
+				}
+			}
+			return httpUrlBuilder.build().toString();
+		} catch (URISyntaxException e) {
+			throw new RuntimeException(e);
 		}
-		return httpUrlBuilder.toString();
 	}
 
-	private Headers getHeaders(Map<String, Object> headers) {
-		Headers.Builder headersBuilder = new Headers.Builder();
-		headersBuilder.add("x-ncp-apigw-sdk-version", SDK_VERSION);
+	private void applyHeaders(SimpleHttpRequest request, Map<String, Object> headers) {
+		request.setHeader("x-ncp-apigw-sdk-version", SDK_VERSION);
 		for (Map.Entry<String, Object> entry : headers.entrySet()) {
-			headersBuilder.add(entry.getKey(), parameterToString(entry.getValue()));
+			request.addHeader(entry.getKey(), parameterToString(entry.getValue()));
 		}
-		return headersBuilder.build();
 	}
 
 	private RequestBody getRequestBody(ApiRequest apiRequest) throws IOException {
@@ -216,53 +224,34 @@ public class ApiClient {
 		Map formParams = apiRequest.getFormParams();
 		Object body = apiRequest.getBody();
 
-		if (apiRequest.isCustomFormParams() == true && apiRequest.getMethod().equalsIgnoreCase("GET") == true) {
+		if (apiRequest.isCustomFormParams() && apiRequest.getMethod().equalsIgnoreCase("GET")) {
 			return null;
 		}
-		if (contentType.startsWith("multipart/form-data") == true) {
-			return getFormData(formParams);
-		}
-		if (contentType.startsWith("application/x-www-form-urlencoded") == true
-			&& apiRequest.isCustomFormParams() == false) {
-			return RequestBody.create(MediaType.parse(contentType), getUrlencodedParams(formParams));
+		if (contentType.startsWith("application/x-www-form-urlencoded")
+			&& !apiRequest.isCustomFormParams()) {
+			return new RequestBody(ContentType.parse(contentType), getUrlencodedParams(formParams));
 		}
 		if (body == null) {
-			if (HttpMethod.permitsRequestBody(apiRequest.getMethod()) == false) {
+			if (!permitsRequestBody(apiRequest.getMethod())) {
 				return null;
-			} else if (HttpMethod.requiresRequestBody(apiRequest.getMethod()) == true) {
-				return RequestBody.create(MediaType.parse(contentType), new String());
+			} else if (requiresRequestBody(apiRequest.getMethod())) {
+				return new RequestBody(ContentType.parse(contentType), "");
 			}
 		}
 		if (body instanceof byte[]) {
-			return RequestBody.create(MediaType.parse(contentType), (byte[])body);
+			return new RequestBody(ContentType.parse(contentType), (byte[])body);
 		}
 
 		Marshaller marshaller = getMarshaller(contentType);
-		return RequestBody.create(MediaType.parse(marshaller.getContentType()), marshaller.writeValueAsString(body));
+		return new RequestBody(ContentType.parse(marshaller.getContentType()), marshaller.writeValueAsString(body));
 	}
 
-	private RequestBody getFormData(Map<String, Object> formParams) {
-		MultipartBody.Builder builder = new MultipartBody.Builder().setType(MultipartBody.FORM);
-		for (Map.Entry<String, Object> param : formParams.entrySet()) {
-			if (param.getValue() instanceof Collection) {
-				for (Object value : (Collection)param.getValue()) {
-					builder.addFormDataPart(param.getKey(), String.valueOf(value));
-				}
-			} else if (param.getValue() instanceof File) {
-				appendFile(builder, param.getKey(), (File)param.getValue());
-			} else {
-				builder.addFormDataPart(param.getKey(), String.valueOf(param.getValue()));
-			}
-		}
-		return builder.build();
+	static boolean permitsRequestBody(String method) {
+		return !(method.equals("GET") || method.equals("HEAD"));
 	}
 
-	private void appendFile(MultipartBody.Builder builder, String key, File file) {
-		String fileName = file.getAbsolutePath().substring(file.getAbsolutePath().lastIndexOf("/") + 1);
-		String contentType = new MimetypesFileTypeMap().getContentType(file);
-		RequestBody fileBody = RequestBody.create(MediaType.parse(contentType), file);
-
-		builder.addFormDataPart(key, fileName, fileBody);
+	static boolean requiresRequestBody(String method) {
+		return method.equals("POST") || method.equals("PUT") || method.equals("PATCH") || method.equals("PROPPATCH") || method.equals("REPORT");
 	}
 
 	private String getUrlencodedParams(Map<String, Object> formParams) throws UnsupportedEncodingException {
@@ -309,135 +298,49 @@ public class ApiClient {
 		}
 	}
 
-	private Response getResponse(Request request) {
-		try {
-			return httpClient.newCall(request).execute();
-		} catch (Exception e) {
-			throw new SdkException("Failed to execute api: " + e.getMessage(), e);
-		}
+	private CompletableFuture<SimpleHttpResponse> getResponse(SimpleHttpRequest request) {
+		CompletableFuture<SimpleHttpResponse> promise = new CompletableFuture<>();
+		httpClient.execute(request, new FutureCallback<SimpleHttpResponse>() {
+			@Override
+			public void completed(SimpleHttpResponse simpleHttpResponse) {
+				promise.complete(simpleHttpResponse);
+			}
+
+			@Override
+			public void failed(Exception e) {
+				promise.completeExceptionally(e);
+			}
+
+			@Override
+			public void cancelled() {
+				promise.completeExceptionally(new SdkException("cancelled"));
+			}
+		});
+		return promise;
 	}
 
 	private Marshaller getMarshaller(String contentType) {
+		ContentType parsed = ContentType.parse(contentType);
 		for (Marshaller marshaller : marshallerSet) {
-			if (MediaType.parse(marshaller.getContentType())
-				.subtype()
-				.equalsIgnoreCase(MediaType.parse(contentType).subtype()) == true) {
+			if (ContentType.parse(marshaller.getContentType()).getMimeType().equals(parsed.getMimeType())) {
 				return marshaller;
 			}
 		}
 		throw new SdkException("Unsupported media type: " + contentType);
 	}
 
-	/**
-	 * The type Api client builder.
-	 */
-	public static class ApiClientBuilder {
-		private long connectTimeout = 1000;
-		private long writeTimeout = 30000;
-		private long readTimeout = 30000;
-		private Set<Marshaller> marshallerSet = new LinkedHashSet();
-		private Credentials credentials;
-		private CredentialsProvider credentialsProvider;
-		private HttpLoggingInterceptor.Level logLevel = HttpLoggingInterceptor.Level.NONE;
+	static class RequestBody {
+		ContentType contentType;
+		byte[] body;
 
-		/**
-		 * Sets connect timeout ms.
-		 *
-		 * @param connectTimeout the connect timeout
-		 * @return the connect timeout ms
-		 */
-		public ApiClientBuilder setConnectTimeoutMs(long connectTimeout) {
-			this.connectTimeout = connectTimeout;
-			return this;
+		RequestBody(ContentType contentType, String body) {
+			this.contentType = contentType;
+			this.body = body.getBytes(contentType.getCharset(StandardCharsets.UTF_8));
 		}
 
-		/**
-		 * Sets write timeout ms.
-		 *
-		 * @param writeTimeout the write timeout
-		 * @return the write timeout ms
-		 */
-		public ApiClientBuilder setWriteTimeoutMs(long writeTimeout) {
-			this.writeTimeout = writeTimeout;
-			return this;
-		}
-
-		/**
-		 * Sets read timeout ms.
-		 *
-		 * @param readTimeout the read timeout
-		 * @return the read timeout ms
-		 */
-		public ApiClientBuilder setReadTimeoutMs(long readTimeout) {
-			this.readTimeout = readTimeout;
-			return this;
-		}
-
-		/**
-		 * Add marshaller api client builder.
-		 *
-		 * @param marshaller the marshaller
-		 * @return the api client builder
-		 */
-		public ApiClientBuilder addMarshaller(Marshaller marshaller) {
-			this.marshallerSet.add(marshaller);
-			return this;
-		}
-
-		/**
-		 * Sets credentials.
-		 *
-		 * @param credentials the credentials
-		 * @return the credentials
-		 */
-		public ApiClientBuilder setCredentials(Credentials credentials) {
-			this.credentials = credentials;
-			return this;
-		}
-
-
-		/**
-		 * Sets credentials provider.
- 		 *
-		 * @param credentialsProvider the credentials provider
-		 * @return ApiClientBuilder
-		 */
-		public ApiClientBuilder setCredentialsProvider(CredentialsProvider credentialsProvider) {
-			this.credentialsProvider = credentialsProvider;
-			return this;
-		}
-
-
-		/**
-		 * Sets logging.
-		 *
-		 * @param logging the logging
-		 * @return the logging
-		 */
-		public ApiClientBuilder setLogging(boolean logging) {
-			if (logging == true) {
-				this.logLevel = HttpLoggingInterceptor.Level.BODY;
-			}
-			return this;
-		}
-
-		/**
-		 * Build api client.
-		 *
-		 * @return the api client
-		 */
-		public ApiClient build() {
-			HttpLoggingInterceptor loggingInterceptor = new HttpLoggingInterceptor();
-			loggingInterceptor.setLevel(logLevel);
-
-			OkHttpClient httpClient = new OkHttpClient.Builder()
-				.connectTimeout(connectTimeout, TimeUnit.MILLISECONDS)
-				.writeTimeout(writeTimeout, TimeUnit.MILLISECONDS)
-				.readTimeout(readTimeout, TimeUnit.MILLISECONDS)
-				.addInterceptor(loggingInterceptor)
-				.build();
-
-			return new ApiClient(httpClient, marshallerSet, credentialsProvider);
+		public RequestBody(ContentType contentType, byte[] body) {
+			this.contentType = contentType;
+			this.body = body;
 		}
 	}
 }

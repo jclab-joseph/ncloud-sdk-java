@@ -9,7 +9,7 @@ import javax.crypto.spec.SecretKeySpec;
 import org.apache.commons.codec.binary.Base64;
 
 import com.ncloud.exception.SdkException;
-import okhttp3.Request;
+import org.apache.hc.client5.http.async.methods.SimpleHttpRequest;
 
 public class NcloudCredentials implements Credentials {
 	private final String accessKey;
@@ -26,21 +26,21 @@ public class NcloudCredentials implements Credentials {
 		}
 	}
 
-	public void applyCredentials(Request.Builder requestBuilder, boolean isRequiredApiKey) {
+	public void applyCredentials(SimpleHttpRequest request, boolean isRequiredApiKey) {
 		long timestamp = (new Date()).getTime();
-		requestBuilder.addHeader("x-ncp-apigw-timestamp", String.valueOf(timestamp));
-		requestBuilder.addHeader("x-ncp-iam-access-key", this.accessKey);
-		requestBuilder.addHeader("x-ncp-apigw-signature-v2", this.makeSignature(timestamp, requestBuilder.build()));
+		request.addHeader("x-ncp-apigw-timestamp", String.valueOf(timestamp));
+		request.addHeader("x-ncp-iam-access-key", this.accessKey);
+		request.addHeader("x-ncp-apigw-signature-v2", this.makeSignature(timestamp, request));
 	}
 
-	private String makeSignature(long timestamp, Request request) {
-		URI uri = request.url().uri();
+	private String makeSignature(long timestamp, SimpleHttpRequest request) {
+		URI uri = URI.create(request.getRequestUri());
 		String pathWithQuery = uri.getRawPath();
 		if (uri.getRawQuery() != null) {
 			pathWithQuery = pathWithQuery + "?" + uri.getRawQuery();
 		}
 
-		StringBuilder message = (new StringBuilder()).append(request.method()).append(" ").append(pathWithQuery).append("\n").append(timestamp).append("\n").append(this.accessKey);
+		StringBuilder message = (new StringBuilder()).append(request.getMethod()).append(" ").append(pathWithQuery).append("\n").append(timestamp).append("\n").append(this.accessKey);
 
 		try {
 			SecretKeySpec signingKey = new SecretKeySpec(this.secretKey.getBytes("UTF-8"), "HmacSHA256");

@@ -7,7 +7,7 @@
 
 package com.ncloud.auth;
 
-import okhttp3.Request;
+import org.apache.hc.client5.http.async.methods.SimpleHttpRequest;
 
 /**
  * The interface Credentials.
@@ -18,5 +18,5 @@ public interface Credentials {
      *
      * @param requestBuilder the request builder
      */
-    void applyCredentials(Request.Builder requestBuilder, boolean isRequiredApiKey);
+    void applyCredentials(SimpleHttpRequest request, boolean isRequiredApiKey);
 }

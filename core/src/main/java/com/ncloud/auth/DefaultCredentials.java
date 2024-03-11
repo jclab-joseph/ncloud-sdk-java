@@ -8,7 +8,7 @@
 package com.ncloud.auth;
 
 import com.ncloud.exception.SdkException;
-import okhttp3.Request;
+import org.apache.hc.client5.http.async.methods.SimpleHttpRequest;
 
 /**
  * The type Default credentials.
@@ -28,9 +28,9 @@ public class DefaultCredentials implements Credentials {
 		this.apiKey = apiKey;
 	}
 
-	public void applyCredentials(Request.Builder requestBuilder, boolean isRequiredApiKey) {
-		if (isRequiredApiKey == true) {
-        	requestBuilder.addHeader("x-ncp-apigw-api-key", apiKey);
+	public void applyCredentials(SimpleHttpRequest request, boolean isRequiredApiKey) {
+		if (isRequiredApiKey) {
+			request.addHeader("x-ncp-apigw-api-key", apiKey);
 		}
     }
 }
